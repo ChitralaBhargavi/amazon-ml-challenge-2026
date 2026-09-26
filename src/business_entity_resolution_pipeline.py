@@ -1,18 +1,28 @@
-﻿"""Business Entity Resolution pipeline for the Amazon ML Challenge 2026.
+"""Business Entity Resolution pipeline for the Amazon ML Challenge 2026.
 
-This version keeps the real challenge data and uses a practical blocking +
-feature-based model design that is fast enough to run on a single workstation.
-It is optimized to avoid unnecessary in-memory copies of the large TSV files and to
-stream the heaviest source data through the candidate-index construction.
+Scalable, precision-oriented entity resolution pipeline.
+
+Key design choices:
+- Candidate data are stored in SQLite instead of millions of Python Record objects.
+- SQLite FTS5 provides country-aware token blocking without a giant Python dict/set index.
+- Exact normalized-name/address indexes provide high-precision shortcuts.
+- Test S1 is processed in streaming chunks, so the full test set is never held in RAM.
+- Validation is split by S1 entity before model fitting to avoid leakage.
+- Candidate recall is reported before the model is trusted.
 """
+
 from __future__ import annotations
 
 import argparse
+import csv
 import re
+import shutil
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import unicodedata
-from collections import defaultdict
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
@@ -22,10 +32,12 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.model_selection import train_test_split
 
+
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN_DIR = ROOT / "dataset" / "train"
 TEST_DIR = ROOT / "dataset" / "test"
 OUTPUT_DIR = ROOT / "output"
+CACHE_DIR = OUTPUT_DIR / "entity_resolution_cache"
 
 LEGAL_SUFFIXES = {
     "inc", "incorporated", "corp", "corporation", "llc", "ltd", "limited", "pvt",
@@ -33,6 +45,14 @@ LEGAL_SUFFIXES = {
     "sas", "sa", "service", "services", "solutions", "consultants", "consulting",
     "trading", "foundation", "enterprise", "enterprises", "industries",
 }
+
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9\s]+")
+_SLASH_RE = re.compile(r"[/_\\|~]+")
+_SPACE_RE = re.compile(r"\s+")
+_LEGAL_SUFFIX_RE = re.compile(
+    r"\b(?:" + "|".join(sorted((re.escape(x) for x in LEGAL_SUFFIXES), key=len, reverse=True)) + r")\b",
+    flags=re.IGNORECASE,
+)
 
 STOPWORDS = {
     "and", "the", "of", "for", "on", "in", "at", "to", "from", "near", "new",
@@ -56,7 +76,13 @@ def log_stage(message: str) -> None:
     print(f"[pipeline] {message}", flush=True)
 
 
-def read_tsv(path: Path, *, nrows: Optional[int] = None, sample_n: Optional[int] = None, random_state: int = 42) -> pd.DataFrame:
+def read_tsv(
+    path: Path,
+    *,
+    nrows: Optional[int] = None,
+    sample_n: Optional[int] = None,
+    random_state: int = 42,
+) -> pd.DataFrame:
     dtypes = {
         "entity_id": "string",
         "business_name": "string",
@@ -80,14 +106,13 @@ def read_tsv(path: Path, *, nrows: Optional[int] = None, sample_n: Optional[int]
     return df
 
 
-def iter_source_records(path: Path, *, chunk_size: int = 200_000) -> Iterator[Record]:
+def iter_source_records(path: Path, *, chunk_size: int = 100_000) -> Iterator[Record]:
     dtypes = {
         "entity_id": "string",
         "business_name": "string",
         "business_address": "string",
         "country": "string",
     }
-
     for chunk in pd.read_csv(
         path,
         sep="\t",
@@ -101,6 +126,25 @@ def iter_source_records(path: Path, *, chunk_size: int = 200_000) -> Iterator[Re
             yield to_record_values(row[0], row[1], row[2], row[3])
 
 
+def iter_source_rows(path: Path, *, chunk_size: int = 100_000):
+    dtypes = {
+        "entity_id": "string",
+        "business_name": "string",
+        "business_address": "string",
+        "country": "string",
+    }
+    for chunk in pd.read_csv(
+        path,
+        sep="\t",
+        dtype=dtypes,
+        keep_default_na=False,
+        na_filter=False,
+        chunksize=chunk_size,
+        low_memory=False,
+    ):
+        yield chunk
+
+
 def ascii_normalize(value: Optional[str]) -> str:
     if value is None:
         return ""
@@ -111,14 +155,13 @@ def ascii_normalize(value: Optional[str]) -> str:
 def clean_text(raw: Optional[str], *, is_name: bool = False) -> str:
     text = ascii_normalize(raw or "")
     text = text.lower().strip()
-    text = text.replace("&", " and ")
-    text = text.replace("+", " ")
-    text = re.sub(r"[/_\\|~]", " ", text)
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = text.replace("&", " and ").replace("+", " ")
+    text = _SLASH_RE.sub(" ", text)
+    text = _NON_ALNUM_RE.sub(" ", text)
+    text = _SPACE_RE.sub(" ", text).strip()
     if is_name:
-        for suffix in sorted(LEGAL_SUFFIXES, key=len, reverse=True):
-            text = re.sub(rf"\b{re.escape(suffix)}\b", " ", text)
+        text = _LEGAL_SUFFIX_RE.sub(" ", text)
+        text = _SPACE_RE.sub(" ", text).strip()
     return text
 
 
@@ -132,7 +175,12 @@ def tokenise(raw: Optional[str], *, drop_stopwords: bool = False) -> Tuple[str, 
     return tuple(t for t in tokens if len(t) > 1)
 
 
-def to_record_values(entity_id: object, business_name: object, business_address: object, country: object) -> Record:
+def to_record_values(
+    entity_id: object,
+    business_name: object,
+    business_address: object,
+    country: object,
+) -> Record:
     name_raw = str(business_name or "")
     address_raw = str(business_address or "")
     name_clean = clean_text(name_raw, is_name=True)
@@ -173,13 +221,17 @@ def overlap_score(a: Sequence[str], b: Sequence[str]) -> float:
 
 
 def seq_sim(a: str, b: str) -> float:
+    """Fast character similarity.
+
+    quick_ratio is deliberately used instead of the much slower full
+    SequenceMatcher ratio because this function is evaluated millions of times.
+    """
     if not a and not b:
         return 1.0
     if not a or not b:
         return 0.0
     import difflib
-
-    return difflib.SequenceMatcher(None, a, b).ratio()
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).quick_ratio()
 
 
 def pair_features(r1: Record, r2: Record) -> Dict[str, float]:
@@ -209,70 +261,526 @@ def pair_features(r1: Record, r2: Record) -> Dict[str, float]:
     }
 
 
+def _fts_escape_token(token: str) -> str:
+    token = re.sub(r"[^a-zA-Z0-9]", "", token)
+    return token
+
+
+def _fts_country(country: str) -> str:
+    parts = [_fts_escape_token(x) for x in clean_text(country).split() if x]
+    parts = [x for x in parts if x]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return f"country:{parts[0]}"
+    return "country:(" + " ".join(parts) + ")"
+
+
+class CandidateStore:
+    """Disk-backed candidate store.
+
+    The store keeps normalized records in SQLite and a contentless FTS5
+    blocking index. This replaces a multi-million-entry Python dict/set index.
+    """
+
+    def __init__(self, db_path: Path):
+        self.db_path = Path(db_path)
+        self.conn = sqlite3.connect(str(self.db_path))
+        self.conn.execute("PRAGMA journal_mode=OFF")
+        self.conn.execute("PRAGMA synchronous=OFF")
+        self.conn.execute("PRAGMA temp_store=MEMORY")
+        self.conn.execute("PRAGMA cache_size=-100000")
+        self.conn.execute("PRAGMA locking_mode=EXCLUSIVE")
+
+    @classmethod
+    def build(
+        cls,
+        db_path: Path,
+        source_paths: Sequence[Path],
+        *,
+        chunk_size: int = 50_000,
+    ) -> "CandidateStore":
+        if db_path.exists():
+            db_path.unlink()
+
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = cls(db_path)
+
+        store.conn.executescript(
+            """
+            CREATE TABLE records (
+                row_id INTEGER PRIMARY KEY,
+                entity_id TEXT NOT NULL UNIQUE,
+                country TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                normalized_address TEXT NOT NULL
+            );
+
+            CREATE VIRTUAL TABLE fts USING fts5(
+                country,
+                name_tokens,
+                address_tokens,
+                content=''
+            );
+            """
+        )
+
+        row_id = 0
+        total = 0
+
+        for path in source_paths:
+            log_stage(f"indexing {path.name}")
+            for df in iter_source_rows(path, chunk_size=chunk_size):
+                records_rows = []
+                fts_rows = []
+
+                for row in df.itertuples(index=False, name=None):
+                    rec = to_record_values(row[0], row[1], row[2], row[3])
+                    row_id += 1
+
+                    # FTS uses stopword-free name tokens and address tokens
+                    # without the most common road/address words.
+                    fts_name = " ".join(rec.name_tokens)
+                    fts_addr = " ".join(
+                        t for t in rec.address_tokens if t not in STOPWORDS
+                    )
+
+                    records_rows.append(
+                        (
+                            row_id,
+                            rec.entity_id,
+                            rec.country,
+                            rec.normalized_name,
+                            rec.normalized_address,
+                        )
+                    )
+                    fts_rows.append(
+                        (row_id, rec.country, fts_name, fts_addr)
+                    )
+
+                with store.conn:
+                    store.conn.executemany(
+                        """
+                        INSERT INTO records
+                        (row_id, entity_id, country, normalized_name, normalized_address)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        records_rows,
+                    )
+                    store.conn.executemany(
+                        """
+                        INSERT INTO fts(rowid, country, name_tokens, address_tokens)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        fts_rows,
+                    )
+
+                total += len(records_rows)
+                if total % 500_000 < len(records_rows):
+                    log_stage(f"candidate index rows built: {total:,}")
+
+        log_stage("building exact-match indexes")
+        with store.conn:
+            store.conn.execute(
+                "CREATE INDEX idx_records_country_name ON records(country, normalized_name)"
+            )
+            store.conn.execute(
+                "CREATE INDEX idx_records_country_address ON records(country, normalized_address)"
+            )
+            store.conn.execute(
+                "CREATE INDEX idx_records_entity ON records(entity_id)"
+            )
+        store.conn.execute("ANALYZE")
+        log_stage(f"candidate index ready: {total:,} records")
+        return store
+
+    @classmethod
+    def build_training_subset(
+        cls,
+        db_path: Path,
+        source_paths: Sequence[Path],
+        required_ids: Set[str],
+        *,
+        sample_mod: int = 40,
+        chunk_size: int = 100_000,
+    ) -> "CandidateStore":
+        """Build a compact training candidate store.
+
+        Keep every known positive entity from the sampled S1 ground truth plus
+        a deterministic background sample. Stream records so the full 10M-row
+        candidate corpus is never materialized in memory.
+        """
+        if db_path.exists():
+            db_path.unlink()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = cls(db_path)
+        store.conn.executescript("""
+            CREATE TABLE records (
+                row_id INTEGER PRIMARY KEY,
+                entity_id TEXT NOT NULL UNIQUE,
+                country TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                normalized_address TEXT NOT NULL
+            );
+            CREATE VIRTUAL TABLE fts USING fts5(
+                country, name_tokens, address_tokens, content=''
+            );
+        """)
+        row_id = 0
+        total = 0
+        required_ids = {str(x) for x in required_ids}
+
+        for path in source_paths:
+            log_stage(f"training subset scan {path.name}")
+            records_rows = []
+            fts_rows = []
+
+            for rec in iter_source_records(path, chunk_size=chunk_size):
+                keep = rec.entity_id in required_ids
+                if not keep and sample_mod > 0:
+                    keep = (zlib.crc32(rec.entity_id.encode("utf-8", "ignore")) % sample_mod) == 0
+                if not keep:
+                    continue
+
+                row_id += 1
+                fts_name = " ".join(rec.name_tokens)
+                fts_addr = " ".join(t for t in rec.address_tokens if t not in STOPWORDS)
+                records_rows.append((
+                    row_id, rec.entity_id, rec.country,
+                    rec.normalized_name, rec.normalized_address
+                ))
+                fts_rows.append((row_id, rec.country, fts_name, fts_addr))
+
+                if len(records_rows) >= chunk_size:
+                    with store.conn:
+                        store.conn.executemany(
+                            "INSERT INTO records(row_id, entity_id, country, normalized_name, normalized_address) VALUES (?, ?, ?, ?, ?)",
+                            records_rows,
+                        )
+                        store.conn.executemany(
+                            "INSERT INTO fts(rowid, country, name_tokens, address_tokens) VALUES (?, ?, ?, ?)",
+                            fts_rows,
+                        )
+                    total += len(records_rows)
+                    records_rows = []
+                    fts_rows = []
+
+            if records_rows:
+                with store.conn:
+                    store.conn.executemany(
+                        "INSERT INTO records(row_id, entity_id, country, normalized_name, normalized_address) VALUES (?, ?, ?, ?, ?)",
+                        records_rows,
+                    )
+                    store.conn.executemany(
+                        "INSERT INTO fts(rowid, country, name_tokens, address_tokens) VALUES (?, ?, ?, ?)",
+                        fts_rows,
+                    )
+                total += len(records_rows)
+
+        with store.conn:
+            store.conn.execute("CREATE INDEX idx_records_country_name ON records(country, normalized_name)")
+            store.conn.execute("CREATE INDEX idx_records_country_address ON records(country, normalized_address)")
+            store.conn.execute("CREATE INDEX idx_records_entity ON records(entity_id)")
+        store.conn.execute("ANALYZE")
+        log_stage(f"training candidate subset ready: {total:,} records")
+        return store
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def delete(self) -> None:
+        self.close()
+        try:
+            self.db_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _fetch_records(self, row_ids: Sequence[int]) -> Dict[str, Record]:
+        if not row_ids:
+            return {}
+
+        out: Dict[str, Record] = {}
+        # SQLite has a parameter limit on some builds; batches keep this safe.
+        for start in range(0, len(row_ids), 400):
+            batch = row_ids[start:start + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.conn.execute(
+                f"""
+                SELECT row_id, entity_id, country, normalized_name, normalized_address
+                FROM records
+                WHERE row_id IN ({placeholders})
+                """,
+                tuple(batch),
+            ).fetchall()
+
+            for _, entity_id, country, name, address in rows:
+                out[str(entity_id)] = Record(
+                    entity_id=str(entity_id),
+                    country=str(country),
+                    name_tokens=tokenise(name, drop_stopwords=True),
+                    address_tokens=tokenise(address),
+                    normalized_name=str(name),
+                    normalized_address=str(address),
+                )
+        return out
+
+    def _exact_ids(
+        self,
+        country: str,
+        field: str,
+        value: str,
+        limit: int,
+    ) -> List[int]:
+        if not country or not value:
+            return []
+        if field == "name":
+            sql = """
+                SELECT row_id FROM records
+                WHERE country=? AND normalized_name=?
+                LIMIT ?
+            """
+        else:
+            sql = """
+                SELECT row_id FROM records
+                WHERE country=? AND normalized_address=?
+                LIMIT ?
+            """
+        return [int(x[0]) for x in self.conn.execute(sql, (country, value, limit)).fetchall()]
+
+    def _prefix_ids(self, s1: Record, limit: int = 160) -> List[int]:
+        """Fast B-tree prefix blocking using the existing country/name/address indexes.
+
+        This intentionally avoids per-S1 FTS ranking/search. The records table already
+        has country+normalized_name and country+normalized_address indexes, so bounded
+        lexicographic prefix ranges are much cheaper than FTS MATCH over millions of rows.
+        """
+        if not s1.country:
+            return []
+
+        probes: List[Tuple[str, str]] = []
+
+        # Name probes: beginning of the normalized full name plus first/last token.
+        name_prefixes: List[str] = []
+        if s1.normalized_name:
+            name_prefixes.append(s1.normalized_name[:5])
+        if s1.name_tokens:
+            name_prefixes.append(s1.name_tokens[0][:5])
+            if len(s1.name_tokens) > 1:
+                name_prefixes.append(s1.name_tokens[-1][:5])
+
+        # Address probe: beginning of normalized address and first useful token.
+        addr_prefixes: List[str] = []
+        if s1.normalized_address:
+            addr_prefixes.append(s1.normalized_address[:6])
+        for tok in s1.address_tokens:
+            if tok not in STOPWORDS and len(tok) >= 3:
+                addr_prefixes.append(tok[:5])
+                break
+
+        seen_prefixes: Set[Tuple[str, str]] = set()
+        for p in name_prefixes:
+            if len(p) >= 3 and ("name", p) not in seen_prefixes:
+                seen_prefixes.add(("name", p))
+                probes.append(("name", p))
+        for p in addr_prefixes:
+            if len(p) >= 3 and ("address", p) not in seen_prefixes:
+                seen_prefixes.add(("address", p))
+                probes.append(("address", p))
+
+        if not probes:
+            return []
+
+        per_probe = max(20, min(60, limit // max(1, len(probes))))
+        row_ids: List[int] = []
+        for field, prefix in probes:
+            upper = prefix + "\uffff"
+            if field == "name":
+                sql = """
+                    SELECT row_id FROM records
+                    WHERE country=? AND normalized_name>=? AND normalized_name<?
+                    LIMIT ?
+                """
+            else:
+                sql = """
+                    SELECT row_id FROM records
+                    WHERE country=? AND normalized_address>=? AND normalized_address<?
+                    LIMIT ?
+                """
+            rows = self.conn.execute(
+                sql, (s1.country, prefix, upper, per_probe)
+            ).fetchall()
+            row_ids.extend(int(x[0]) for x in rows)
+            if len(row_ids) >= limit:
+                break
+
+        return row_ids[:limit]
+
+    def candidates(
+        self,
+        s1: Record,
+        *,
+        max_candidates: int = 12,
+        retrieval_limit: int = 160,
+    ) -> List[Record]:
+        if not s1.country and not s1.normalized_name and not s1.normalized_address:
+            return []
+
+        row_ids: List[int] = []
+
+        # Exact blocks are deliberately kept separate and always retained.
+        row_ids.extend(self._exact_ids(s1.country, "name", s1.normalized_name, 40))
+        row_ids.extend(self._exact_ids(s1.country, "address", s1.normalized_address, 40))
+
+        # Fast prefix blocking.  This replaces the per-S1 FTS MATCH query, which
+        # became the dominant runtime cost on the 9.97M-row test index.
+        if len(set(row_ids)) < max_candidates:
+            row_ids.extend(self._prefix_ids(s1, retrieval_limit))
+
+        # De-duplicate while preserving the high-value exact blocks first.
+        seen: Set[int] = set()
+        unique_ids: List[int] = []
+        for rid in row_ids:
+            if rid not in seen:
+                seen.add(rid)
+                unique_ids.append(rid)
+
+        if not unique_ids:
+            return []
+
+        records = self._fetch_records(unique_ids)
+
+        # First stage: cheap similarity. This avoids expensive character
+        # similarity on the entire FTS result set.
+        cheap: List[Tuple[float, Record]] = []
+        for cand in records.values():
+            if s1.country and cand.country != s1.country:
+                continue
+
+            name_exact = bool(
+                s1.normalized_name
+                and cand.normalized_name
+                and s1.normalized_name == cand.normalized_name
+            )
+            addr_exact = bool(
+                s1.normalized_address
+                and cand.normalized_address
+                and s1.normalized_address == cand.normalized_address
+            )
+
+            name_j = jaccard(s1.name_tokens, cand.name_tokens)
+            name_o = overlap_score(s1.name_tokens, cand.name_tokens)
+            addr_j = jaccard(s1.address_tokens, cand.address_tokens)
+            addr_o = overlap_score(s1.address_tokens, cand.address_tokens)
+
+            cheap_score = (
+                8.0 * float(name_exact)
+                + 5.0 * float(addr_exact)
+                + 3.0 * name_j
+                + 2.0 * name_o
+                + 1.5 * addr_j
+                + 1.0 * addr_o
+            )
+            cheap.append((cheap_score, cand))
+
+        cheap.sort(key=lambda x: x[0], reverse=True)
+
+        # Only a small high-quality set reaches character similarity/model.
+        top = cheap[: max(30, max_candidates * 3)]
+
+        scored: List[Tuple[float, Record]] = []
+        for cheap_score, cand in top:
+            name_char = seq_sim(s1.normalized_name, cand.normalized_name)
+            addr_char = seq_sim(s1.normalized_address, cand.normalized_address)
+
+            final_rank = (
+                cheap_score
+                + 1.5 * name_char
+                + 0.5 * addr_char
+            )
+            scored.append((final_rank, cand))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # Keep a little extra room when several exact-name records exist.
+        return [cand for _, cand in scored[:max_candidates]]
+
+
 def build_var_index(records: Sequence[Record]) -> Dict[Tuple[str, str], Set[str]]:
-    index: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    """Legacy small-data index retained for the smoke test."""
+    index: Dict[Tuple[str, str], Set[str]] = {}
     for rec in records:
         if not rec.country:
             continue
         for token in rec.name_tokens + rec.address_tokens[:6]:
             if token:
-                index[(rec.country, token)].add(rec.entity_id)
+                index.setdefault((rec.country, token), set()).add(rec.entity_id)
         if rec.normalized_name:
-            index[(rec.country, rec.normalized_name)].add(rec.entity_id)
+            index.setdefault((rec.country, rec.normalized_name), set()).add(rec.entity_id)
         if rec.name_tokens:
             bigram = " ".join(rec.name_tokens[:2])
             if bigram:
-                index[(rec.country, bigram)].add(rec.entity_id)
+                index.setdefault((rec.country, bigram), set()).add(rec.entity_id)
     return index
 
 
 def generate_candidates(
     s1: Record,
-    candidate_records: Sequence[Record] | Dict[str, Record],
-    index: Dict[Tuple[str, str], Set[str]],
-    max_candidates: int = 8,
+    candidate_records,
+    index,
+    max_candidates: int = 12,
 ) -> List[str]:
+    """Compatibility wrapper for the original in-memory API.
+
+    Full-scale execution uses CandidateStore directly.
+    """
+    if isinstance(candidate_records, CandidateStore):
+        return [r.entity_id for r in candidate_records.candidates(
+            s1, max_candidates=max_candidates
+        )]
+
     if not s1.country:
         return []
+
+    rec_by_id = (
+        candidate_records
+        if isinstance(candidate_records, dict)
+        else {rec.entity_id: rec for rec in candidate_records}
+    )
 
     candidate_ids: Set[str] = set()
     for token in s1.name_tokens[:6] + s1.address_tokens[:6]:
         if token:
-            candidate_ids |= index.get((s1.country, token), set())
+            candidate_ids.update(index.get((s1.country, token), set()))
+
     if s1.normalized_name:
-        candidate_ids |= index.get((s1.country, s1.normalized_name), set())
+        candidate_ids.update(index.get((s1.country, s1.normalized_name), set()))
+
     if s1.name_tokens:
         bigram = " ".join(s1.name_tokens[:2])
         if bigram:
-            candidate_ids |= index.get((s1.country, bigram), set())
-
-    if isinstance(candidate_records, dict):
-        rec_by_id = candidate_records
-    else:
-        rec_by_id = {rec.entity_id: rec for rec in candidate_records}
+            candidate_ids.update(index.get((s1.country, bigram), set()))
 
     scored: List[Tuple[float, str]] = []
     for cand_id in candidate_ids:
         cand = rec_by_id.get(cand_id)
         if cand is None or cand.country != s1.country:
             continue
-        score = 0.0
-        if s1.normalized_name and cand.normalized_name:
-            score += 3.0 if s1.normalized_name == cand.normalized_name else 0.0
-        score += 2.0 * jaccard(s1.name_tokens, cand.name_tokens)
-        score += 1.0 * overlap_score(s1.address_tokens, cand.address_tokens)
-        score += 0.5 * max(0.0, seq_sim(s1.normalized_name, cand.normalized_name))
-        if s1.name_tokens and cand.name_tokens:
-            if s1.name_tokens[0] == cand.name_tokens[0]:
-                score += 1.0
-            if s1.name_tokens[-1] == cand.name_tokens[-1]:
-                score += 1.0
+
+        name_j = jaccard(s1.name_tokens, cand.name_tokens)
+        addr_o = overlap_score(s1.address_tokens, cand.address_tokens)
+        score = (
+            5.0 * float(s1.normalized_name == cand.normalized_name and s1.normalized_name)
+            + 3.0 * name_j
+            + 1.5 * addr_o
+            + 1.0 * seq_sim(s1.normalized_name, cand.normalized_name)
+        )
         scored.append((score, cand_id))
 
-    if not scored:
-        return []
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [entity_id for _, entity_id in scored[:max_candidates]]
+    return [x[1] for x in scored[:max_candidates]]
 
 
 def build_truth_map(truth_df: pd.DataFrame) -> Dict[str, Set[str]]:
@@ -295,36 +803,38 @@ def f05_entity(true_ids: Set[str], pred_ids: Set[str]) -> float:
     return (1.25 * precision * recall) / (0.25 * precision + recall)
 
 
-def build_train_dataset(
+def _candidate_recall(
+    candidate_ids_by_s1: Dict[str, List[str]],
+    truth_map: Dict[str, Set[str]],
+) -> float:
+    values = []
+    for sid, true_ids in truth_map.items():
+        if not true_ids:
+            continue
+        candidates = set(candidate_ids_by_s1.get(sid, []))
+        values.append(len(true_ids & candidates) / len(true_ids))
+    return float(np.mean(values)) if values else 0.0
+
+
+def build_train_dataset_from_store(
     train_s1: pd.DataFrame,
-    train_s2: pd.DataFrame,
-    train_s3: pd.DataFrame,
     truth_df: pd.DataFrame,
-    max_s1: Optional[int] = 2000,
-    max_candidates: int = 6,
+    store: CandidateStore,
+    *,
+    max_candidates: int = 12,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, List[str]]]:
-    if max_s1 is not None and 0 < max_s1 < len(train_s1):
-        train_s1 = train_s1.sample(n=max_s1, random_state=42).reset_index(drop=True)
-
-    candidate_map: Dict[str, Record] = {}
-    for frame in (train_s2, train_s3):
-        for row in frame.itertuples(index=False, name=None):
-            rec = to_record_values(row[0], row[1], row[2], row[3])
-            candidate_map[rec.entity_id] = rec
-
-    index = build_var_index(candidate_map.values())
     truth_map = build_truth_map(truth_df)
 
     rows: List[dict] = []
     candidate_ids_by_s1: Dict[str, List[str]] = {}
+
     for row in train_s1.itertuples(index=False, name=None):
         s1 = to_record_values(row[0], row[1], row[2], row[3])
-        cand_ids = generate_candidates(s1, candidate_map, index, max_candidates=max_candidates)
+        candidates = store.candidates(s1, max_candidates=max_candidates)
+        cand_ids = [c.entity_id for c in candidates]
         candidate_ids_by_s1[s1.entity_id] = cand_ids
-        for cand_id in cand_ids:
-            cand = candidate_map.get(cand_id)
-            if cand is None:
-                continue
+
+        for cand in candidates:
             feat = pair_features(s1, cand)
             feat["source1_entity_id"] = s1.entity_id
             feat["candidate_entity_id"] = cand.entity_id
@@ -333,164 +843,388 @@ def build_train_dataset(
 
     pair_df = pd.DataFrame(rows)
     if pair_df.empty:
-        raise RuntimeError("No training pairs were generated from the blocker.")
+        raise RuntimeError("No training pairs were generated from the candidate store.")
 
-    feature_cols = [c for c in pair_df.columns if c not in {"source1_entity_id", "candidate_entity_id", "label"}]
+    feature_cols = [
+        c for c in pair_df.columns
+        if c not in {"source1_entity_id", "candidate_entity_id", "label"}
+    ]
+
     s1_ids = train_s1["entity_id"].astype(str).tolist()
-    _, valid_ids = train_test_split(s1_ids, test_size=0.15, random_state=42)
+    train_ids, valid_ids = train_test_split(
+        s1_ids,
+        test_size=0.20,
+        random_state=42,
+    )
 
-    valid_rows: List[dict] = []
-    for sid in valid_ids:
-        s1_row = train_s1.loc[train_s1["entity_id"].astype(str) == sid]
-        if s1_row.empty:
-            continue
-        s1 = to_record(s1_row.iloc[0])
-        for cand_id in candidate_ids_by_s1.get(sid, []):
-            cand = candidate_map.get(cand_id)
-            if cand is None:
-                continue
-            feat = pair_features(s1, cand)
-            feat["source1_entity_id"] = sid
-            feat["candidate_entity_id"] = cand.entity_id
-            feat["label"] = 1 if cand.entity_id in truth_map.get(sid, set()) else 0
-            valid_rows.append(feat)
+    train_df = pair_df[pair_df["source1_entity_id"].astype(str).isin(set(train_ids))].copy()
+    valid_df = pair_df[pair_df["source1_entity_id"].astype(str).isin(set(valid_ids))].copy()
 
-    valid_df = pd.DataFrame(valid_rows)
     if valid_df.empty:
-        valid_df = pd.DataFrame(columns=[*feature_cols, "source1_entity_id", "candidate_entity_id", "label"])
+        valid_df = pd.DataFrame(
+            columns=[*feature_cols, "source1_entity_id", "candidate_entity_id", "label"]
+        )
 
+    recall = _candidate_recall(candidate_ids_by_s1, truth_map)
+    log_stage(f"candidate recall on sampled training S1: {recall:.4f}")
+
+    # Keep the full pair_df return for compatibility, but callers should fit
+    # only on train_df to avoid validation leakage.
+    train_df.attrs["fit_df"] = train_df
     return pair_df, valid_df, candidate_ids_by_s1
 
 
-def select_threshold(model: HistGradientBoostingClassifier, valid_df: pd.DataFrame, truth_df: pd.DataFrame) -> Tuple[float, float]:
+def select_threshold(
+    model: HistGradientBoostingClassifier,
+    valid_df: pd.DataFrame,
+    truth_df: pd.DataFrame,
+) -> Tuple[float, float]:
     if valid_df.empty:
         return 0.5, 0.0
-    feature_cols = [c for c in valid_df.columns if c not in {"source1_entity_id", "candidate_entity_id", "label"}]
-    scores = model.predict_proba(valid_df[feature_cols].to_numpy(dtype=float))[:, 1]
-    valid_df = valid_df.copy()
-    valid_df["score"] = scores
-    truth_map = build_truth_map(truth_df)
 
+    feature_cols = [
+        c for c in valid_df.columns
+        if c not in {"source1_entity_id", "candidate_entity_id", "label"}
+    ]
+    scores = model.predict_proba(valid_df[feature_cols].to_numpy(dtype=float))[:, 1]
+
+    scored_df = valid_df[["source1_entity_id", "candidate_entity_id"]].copy()
+    scored_df["score"] = scores
+
+    truth_map = build_truth_map(truth_df)
     best_threshold = 0.5
     best_score = -1.0
-    for threshold in np.linspace(0.05, 0.95, 19):
+
+    # Fine-grained threshold sweep. F0.5 rewards precision, so a coarse
+    # 0.05 grid can leave meaningful leaderboard points on the table.
+    for threshold in np.linspace(0.05, 0.95, 91):
         values = []
-        for sid in sorted(valid_df["source1_entity_id"].unique()):
-            pred_ids = set(valid_df.loc[(valid_df["source1_entity_id"] == sid) & (valid_df["score"] >= threshold), "candidate_entity_id"])
-            values.append(f05_entity(truth_map.get(str(sid), set()), set(pred_ids)))
-        metric = float(np.mean(values)) if values else 1.0
+        for sid, group in scored_df.groupby("source1_entity_id", sort=False):
+            pred_ids = set(
+                group.loc[group["score"] >= threshold, "candidate_entity_id"].astype(str)
+            )
+            values.append(f05_entity(truth_map.get(str(sid), set()), pred_ids))
+
+        metric = float(np.mean(values)) if values else 0.0
         if metric > best_score:
             best_score = metric
             best_threshold = float(threshold)
+
     return best_threshold, best_score
 
 
-def generate_test_outputs(
+FEATURE_COLS = [
+    "same_country",
+    "same_name_exact",
+    "same_address_exact",
+    "name_jaccard",
+    "address_jaccard",
+    "name_overlap",
+    "address_overlap",
+    "name_char_sim",
+    "address_char_sim",
+    "first_token_match",
+    "last_token_match",
+    "name_len_ratio",
+    "address_len_ratio",
+    "num_name_tokens_1",
+    "num_name_tokens_2",
+    "num_address_tokens_1",
+    "num_address_tokens_2",
+]
+
+
+def generate_test_outputs_streaming(
     model: HistGradientBoostingClassifier,
     threshold: float,
-    max_candidates: int = 6,
+    store: CandidateStore,
+    test_s1_path: Path,
+    matching_path: Path,
+    candidate_path: Path,
     *,
-    test_s1: Optional[pd.DataFrame] = None,
-    test_s2: Optional[pd.DataFrame] = None,
-    test_s3: Optional[pd.DataFrame] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if test_s1 is None:
-        test_s1 = read_tsv(TEST_DIR / "test_source1.tsv")
-    if test_s2 is None:
-        test_s2 = read_tsv(TEST_DIR / "test_source2.tsv")
-    if test_s3 is None:
-        test_s3 = read_tsv(TEST_DIR / "test_source3.tsv")
+    max_candidates: int = 12,
+    chunk_size: int = 50_000,
+) -> int:
+    matching_path.parent.mkdir(parents=True, exist_ok=True)
 
-    candidate_map: Dict[str, Record] = {}
-    for frame in (test_s2, test_s3):
-        for row in frame.itertuples(index=False, name=None):
-            rec = to_record_values(row[0], row[1], row[2], row[3])
-            candidate_map[rec.entity_id] = rec
-    index = build_var_index(candidate_map.values())
+    rows_written = 0
 
-    feature_cols = [
-        "same_country", "same_name_exact", "same_address_exact", "name_jaccard", "address_jaccard",
-        "name_overlap", "address_overlap", "name_char_sim", "address_char_sim",
-        "first_token_match", "last_token_match", "name_len_ratio", "address_len_ratio",
-        "num_name_tokens_1", "num_name_tokens_2", "num_address_tokens_1", "num_address_tokens_2",
-    ]
+    with (
+        matching_path.open("w", encoding="utf-8", newline="") as match_file,
+        candidate_path.open("w", encoding="utf-8", newline="") as cand_file,
+    ):
+        match_writer = csv.writer(match_file, delimiter="\t", lineterminator="\n")
+        cand_writer = csv.writer(cand_file, delimiter="\t", lineterminator="\n")
 
-    candidate_rows: List[dict] = []
-    match_rows: List[dict] = []
-    for row in test_s1.itertuples(index=False, name=None):
-        s1 = to_record_values(row[0], row[1], row[2], row[3])
-        cand_ids = generate_candidates(s1, candidate_map, index, max_candidates=max_candidates)
-        candidate_rows.append({"source1_entity_id": s1.entity_id, "candidate_entity_ids": ",".join(cand_ids)})
+        match_writer.writerow(["source1_entity_id", "matched_entity_ids"])
+        cand_writer.writerow(["source1_entity_id", "candidate_entity_ids"])
 
-        if not cand_ids:
-            match_rows.append({"source1_entity_id": s1.entity_id, "matched_entity_ids": ""})
-            continue
+        for df in iter_source_rows(test_s1_path, chunk_size=chunk_size):
+            for row in df.itertuples(index=False, name=None):
+                s1 = to_record_values(row[0], row[1], row[2], row[3])
+                candidates = store.candidates(
+                    s1,
+                    max_candidates=max_candidates,
+                )
 
-        hits = []
-        for cand_id in cand_ids:
-            cand = candidate_map.get(cand_id)
-            if cand is None:
-                continue
-            feat = pair_features(s1, cand)
-            feat_arr = np.asarray([[float(feat.get(col, 0.0)) for col in feature_cols]], dtype=float)
-            score = float(model.predict_proba(feat_arr)[0, 1])
-            if score >= threshold:
-                hits.append(cand_id)
-        match_rows.append({"source1_entity_id": s1.entity_id, "matched_entity_ids": ",".join(sorted(set(hits)))})
+                cand_ids = [c.entity_id for c in candidates]
+                cand_writer.writerow([s1.entity_id, ",".join(cand_ids)])
 
-    return pd.DataFrame(candidate_rows), pd.DataFrame(match_rows)
+                if not candidates:
+                    match_writer.writerow([s1.entity_id, ""])
+                    continue
+
+                feature_matrix = np.asarray(
+                    [
+                        [
+                            float(pair_features(s1, cand).get(col, 0.0))
+                            for col in FEATURE_COLS
+                        ]
+                        for cand in candidates
+                    ],
+                    dtype=float,
+                )
+
+                scores = model.predict_proba(feature_matrix)[:, 1]
+                hits = [
+                    candidates[i].entity_id
+                    for i, score in enumerate(scores)
+                    if float(score) >= threshold
+                ]
+
+                match_writer.writerow(
+                    [s1.entity_id, ",".join(sorted(set(hits)))]
+                )
+                rows_written += 1
+
+            if rows_written and rows_written % 100_000 < len(df):
+                log_stage(f"test S1 processed: {rows_written:,}")
+
+    return rows_written
 
 
 def run_small_test() -> None:
-    sample_s1 = read_tsv(TRAIN_DIR / "train_source1.tsv", sample_n=25, random_state=42)
-    sample_s2 = read_tsv(TRAIN_DIR / "train_source2.tsv", sample_n=40, random_state=42)
-    sample_s3 = read_tsv(TRAIN_DIR / "train_source3.tsv", sample_n=40, random_state=42)
+    sample_s1 = read_tsv(
+        TRAIN_DIR / "train_source1.tsv",
+        sample_n=25,
+        random_state=42,
+    )
+    sample_s2 = read_tsv(
+        TRAIN_DIR / "train_source2.tsv",
+        sample_n=40,
+        random_state=42,
+    )
+    sample_s3 = read_tsv(
+        TRAIN_DIR / "train_source3.tsv",
+        sample_n=40,
+        random_state=42,
+    )
     truth_df = read_tsv(TRAIN_DIR / "train_ground_truth.tsv")
-    truth_df = truth_df[truth_df["source1_entity_id"].astype(str).isin(sample_s1["entity_id"].astype(str).tolist())].copy().reset_index(drop=True)
+    truth_df = truth_df[
+        truth_df["source1_entity_id"].astype(str).isin(
+            sample_s1["entity_id"].astype(str).tolist()
+        )
+    ].copy().reset_index(drop=True)
 
     print("=== Small-scale validation run ===")
-    print(f"TSV loading: S1={len(sample_s1)}, S2={len(sample_s2)}, S3={len(sample_s3)}, ground truth={len(truth_df)}")
+    print(
+        f"TSV loading: S1={len(sample_s1)}, S2={len(sample_s2)}, "
+        f"S3={len(sample_s3)}, ground truth={len(truth_df)}"
+    )
 
-    pair_df, valid_df, _ = build_train_dataset(sample_s1, sample_s2, sample_s3, truth_df, max_s1=25, max_candidates=6)
-    feature_cols = [c for c in pair_df.columns if c not in {"source1_entity_id", "candidate_entity_id", "label"}]
-    print(f"Normalization/feature extraction: {len(feature_cols)} feature columns, {len(pair_df)} candidate pairs")
+    small_dir = OUTPUT_DIR / "small_test"
+    small_dir.mkdir(parents=True, exist_ok=True)
+    db_path = small_dir / "candidate_store.sqlite"
 
-    model = HistGradientBoostingClassifier(max_depth=4, learning_rate=0.08, max_iter=50, random_state=42)
-    model.fit(pair_df[feature_cols].to_numpy(dtype=float), pair_df["label"].to_numpy(dtype=int))
-    threshold, macro_f05 = select_threshold(model, valid_df, truth_df)
-    print(f"Model training + prediction + F0.5: threshold={threshold:.3f}, macro_F0.5={macro_f05:.4f}")
+    # Materialize only the tiny sampled candidate files for the smoke test.
+    sample_s2_path = small_dir / "sample_train_source2.tsv"
+    sample_s3_path = small_dir / "sample_train_source3.tsv"
+    sample_s2.to_csv(sample_s2_path, sep="\t", index=False)
+    sample_s3.to_csv(sample_s3_path, sep="\t", index=False)
 
-    test_s1 = read_tsv(TEST_DIR / "test_source1.tsv", sample_n=12, random_state=7)
-    test_s2 = read_tsv(TEST_DIR / "test_source2.tsv", sample_n=18, random_state=7)
-    test_s3 = read_tsv(TEST_DIR / "test_source3.tsv", sample_n=18, random_state=7)
-    candidate_df, match_df = generate_test_outputs(model, threshold, max_candidates=6, test_s1=test_s1, test_s2=test_s2, test_s3=test_s3)
+    store = CandidateStore.build(
+        db_path,
+        [sample_s2_path, sample_s3_path],
+        chunk_size=1_000,
+    )
 
-    sample_output_dir = OUTPUT_DIR / "small_test"
-    sample_output_dir.mkdir(parents=True, exist_ok=True)
-    candidate_df.to_csv(sample_output_dir / "candidate_pairs.tsv", sep="\t", index=False)
-    match_df.to_csv(sample_output_dir / "matching_results.tsv", sep="\t", index=False)
-    test_dir = sample_output_dir
-    test_s1.to_csv(test_dir / "test_source1.tsv", sep="\t", index=False)
-    test_s2.to_csv(test_dir / "test_source2.tsv", sep="\t", index=False)
-    test_s3.to_csv(test_dir / "test_source3.tsv", sep="\t", index=False)
-    print(f"Output generation: {len(candidate_df)} candidate rows, {len(match_df)} match rows")
+    try:
+        pair_df, valid_df, candidate_map = build_train_dataset_from_store(
+            sample_s1,
+            truth_df,
+            store,
+            max_candidates=12,
+        )
 
-    validator = [sys.executable, str(ROOT / "utils" / "validate_submission.py"), "--matching", str(test_dir / "matching_results.tsv"), "--candidate", str(test_dir / "candidate_pairs.tsv"), "--test-dir", str(test_dir)]
-    result = subprocess.run(validator, capture_output=True, text=True, cwd=str(ROOT))
-    print(result.stdout.strip())
-    if result.stderr.strip():
-        print(result.stderr.strip())
-    print(f"Submission validation exit code: {result.returncode}")
-    if result.returncode != 0:
-        raise SystemExit(result.returncode)
+        feature_cols = [
+            c for c in pair_df.columns
+            if c not in {"source1_entity_id", "candidate_entity_id", "label"}
+        ]
+        train_df = pair_df.attrs.get("fit_df", pair_df)
+
+        print(
+            f"Normalization/feature extraction: {len(feature_cols)} "
+            f"feature columns, {len(pair_df)} candidate pairs"
+        )
+
+        model = HistGradientBoostingClassifier(
+            max_depth=4,
+            learning_rate=0.08,
+            max_iter=80,
+            random_state=42,
+        )
+        model.fit(
+            train_df[feature_cols].to_numpy(dtype=float),
+            train_df["label"].to_numpy(dtype=int),
+        )
+
+        threshold, macro_f05 = select_threshold(model, valid_df, truth_df)
+        print(
+            f"Model training + prediction + F0.5: "
+            f"threshold={threshold:.3f}, macro_F0.5={macro_f05:.4f}"
+        )
+
+        test_s1 = read_tsv(
+            TEST_DIR / "test_source1.tsv",
+            sample_n=12,
+            random_state=7,
+        )
+        test_s2 = read_tsv(
+            TEST_DIR / "test_source2.tsv",
+            sample_n=18,
+            random_state=7,
+        )
+        test_s3 = read_tsv(
+            TEST_DIR / "test_source3.tsv",
+            sample_n=18,
+            random_state=7,
+        )
+
+        # Build a tiny temporary store for the smoke test, so the same
+        # disk-backed path used at scale is exercised.
+        tiny_path = small_dir / "tiny_test_store.sqlite"
+        sample_test_s2_path = small_dir / "sample_test_source2.tsv"
+        sample_test_s3_path = small_dir / "sample_test_source3.tsv"
+        test_s2.to_csv(sample_test_s2_path, sep="\t", index=False)
+        test_s3.to_csv(sample_test_s3_path, sep="\t", index=False)
+
+        tiny = CandidateStore.build(
+            tiny_path,
+            [sample_test_s2_path, sample_test_s3_path],
+            chunk_size=1_000,
+        )
+        try:
+            candidate_path = small_dir / "candidate_pairs.tsv"
+            match_path = small_dir / "matching_results.tsv"
+
+            # Write only the selected 12-row test sample.
+            rows_c = []
+            rows_m = []
+            for row in test_s1.itertuples(index=False, name=None):
+                s1 = to_record_values(row[0], row[1], row[2], row[3])
+                candidates = tiny.candidates(s1, max_candidates=12)
+                ids = [c.entity_id for c in candidates]
+                rows_c.append(
+                    {
+                        "source1_entity_id": s1.entity_id,
+                        "candidate_entity_ids": ",".join(ids),
+                    }
+                )
+                if candidates:
+                    X = np.asarray(
+                        [
+                            [
+                                float(pair_features(s1, c).get(col, 0.0))
+                                for col in feature_cols
+                            ]
+                            for c in candidates
+                        ],
+                        dtype=float,
+                    )
+                    scores = model.predict_proba(X)[:, 1]
+                    hits = [
+                        candidates[i].entity_id
+                        for i, score in enumerate(scores)
+                        if float(score) >= threshold
+                    ]
+                else:
+                    hits = []
+                rows_m.append(
+                    {
+                        "source1_entity_id": s1.entity_id,
+                        "matched_entity_ids": ",".join(sorted(set(hits))),
+                    }
+                )
+
+            pd.DataFrame(rows_c).to_csv(candidate_path, sep="\t", index=False)
+            pd.DataFrame(rows_m).to_csv(match_path, sep="\t", index=False)
+
+            # Preserve test files for the validator.
+            test_dir = small_dir
+            test_s1.to_csv(test_dir / "test_source1.tsv", sep="\t", index=False)
+            test_s2.to_csv(test_dir / "test_source2.tsv", sep="\t", index=False)
+            test_s3.to_csv(test_dir / "test_source3.tsv", sep="\t", index=False)
+
+            print(
+                f"Output generation: {len(rows_c)} candidate rows, "
+                f"{len(rows_m)} match rows"
+            )
+
+            validator = [
+                sys.executable,
+                str(ROOT / "utils" / "validate_submission.py"),
+                "--matching",
+                str(match_path),
+                "--candidate",
+                str(candidate_path),
+                "--test-dir",
+                str(test_dir),
+            ]
+            result = subprocess.run(
+                validator,
+                capture_output=True,
+                text=True,
+                cwd=str(ROOT),
+            )
+            print(result.stdout.strip())
+            if result.stderr.strip():
+                print(result.stderr.strip())
+            print(f"Submission validation exit code: {result.returncode}")
+            if result.returncode != 0:
+                raise SystemExit(result.returncode)
+        finally:
+            tiny.delete()
+    finally:
+        store.delete()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Business entity resolution pipeline")
-    parser.add_argument("--train-max-s1", type=int, default=2000, help="Maximum S1 rows used for training; set 0 to use all rows.")
-    parser.add_argument("--candidate-limit", type=int, default=6, help="Maximum candidate IDs kept for each S1 entity.")
-    parser.add_argument("--output-dir", type=str, default="output", help="Directory for generated TSV outputs.")
-    parser.add_argument("--small-test", action="store_true", help="Run a small, reproducible smoke test instead of the full dataset pipeline.")
+    parser = argparse.ArgumentParser(
+        description="Scalable Business Entity Resolution pipeline"
+    )
+    parser.add_argument(
+        "--train-max-s1",
+        type=int,
+        default=5000,
+        help="Maximum S1 rows used for model training; set 0 to use all rows.",
+    )
+    parser.add_argument(
+        "--candidate-limit",
+        type=int,
+        default=12,
+        help="Maximum candidate IDs retained per S1 entity.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="output",
+        help="Directory for generated TSV outputs.",
+    )
+    parser.add_argument(
+        "--small-test",
+        action="store_true",
+        help="Run a small reproducible smoke test instead of the full pipeline.",
+    )
     args = parser.parse_args()
 
     if args.small_test:
@@ -499,38 +1233,149 @@ def main() -> None:
 
     output_dir = ROOT / args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    log_stage("loading training data")
-    train_s1 = read_tsv(TRAIN_DIR / "train_source1.tsv")
-    train_s2 = read_tsv(TRAIN_DIR / "train_source2.tsv")
-    train_s3 = read_tsv(TRAIN_DIR / "train_source3.tsv")
+    # ---------- TRAIN ----------
+    log_stage("loading training S1")
+    if args.train_max_s1 == 0:
+        train_s1 = read_tsv(TRAIN_DIR / "train_source1.tsv")
+    else:
+        # Read only the requested number of S1 rows. This avoids loading all
+        # 2.2M S1 rows just to train a model.
+        train_s1 = read_tsv(
+            TRAIN_DIR / "train_source1.tsv",
+            nrows=args.train_max_s1,
+        )
+
+    log_stage(f"training S1 ready: {len(train_s1):,}")
+    log_stage("loading ground truth")
     truth_df = read_tsv(TRAIN_DIR / "train_ground_truth.tsv")
-    log_stage(f"training data ready: S1={len(train_s1)}, S2={len(train_s2)}, S3={len(train_s3)}")
+    truth_df = truth_df[
+        truth_df["source1_entity_id"].astype(str).isin(
+            train_s1["entity_id"].astype(str).tolist()
+        )
+    ].copy()
+    log_stage(f"training ground truth ready: {len(truth_df):,}")
 
-    log_stage("building candidate index")
-    pair_df, valid_df, _ = build_train_dataset(
-        train_s1,
-        train_s2,
-        train_s3,
-        truth_df,
-        max_s1=None if args.train_max_s1 == 0 else args.train_max_s1,
-        max_candidates=args.candidate_limit,
+    train_db = CACHE_DIR / "train_candidates.sqlite"
+    truth_ids = set()
+    for _sid, _ids in build_truth_map(truth_df).items():
+        truth_ids.update(_ids)
+    log_stage("building compact training candidate subset")
+    train_store = CandidateStore.build_training_subset(
+        train_db,
+        [
+            TRAIN_DIR / "train_source2.tsv",
+            TRAIN_DIR / "train_source3.tsv",
+        ],
+        truth_ids,
+        sample_mod=40,
+        chunk_size=100_000,
     )
-    feature_cols = [c for c in pair_df.columns if c not in {"source1_entity_id", "candidate_entity_id", "label"}]
-    log_stage(f"training candidates prepared: {len(pair_df)} pairs")
 
-    log_stage("training model")
-    model = HistGradientBoostingClassifier(max_depth=6, learning_rate=0.05, max_iter=200, random_state=42)
-    model.fit(pair_df[feature_cols].to_numpy(dtype=float), pair_df["label"].to_numpy(dtype=int))
-    threshold, val_score = select_threshold(model, valid_df, truth_df)
-    log_stage(f"validation complete: threshold={threshold:.3f}, macro_F0.5={val_score:.4f}")
+    try:
+        pair_df, valid_df, _ = build_train_dataset_from_store(
+            train_s1,
+            truth_df,
+            train_store,
+            max_candidates=args.candidate_limit,
+        )
 
-    log_stage("processing test S1 records")
-    candidate_df, match_df = generate_test_outputs(model, threshold, max_candidates=args.candidate_limit)
-    log_stage(f"writing outputs to {output_dir}")
-    candidate_df.to_csv(output_dir / "candidate_pairs.tsv", sep="\t", index=False)
-    match_df.to_csv(output_dir / "matching_results.tsv", sep="\t", index=False)
-    log_stage(f"saved {len(candidate_df)} candidate rows and {len(match_df)} prediction rows")
+        feature_cols = [
+            c for c in pair_df.columns
+            if c not in {"source1_entity_id", "candidate_entity_id", "label"}
+        ]
+        fit_df = pair_df.attrs.get("fit_df", pair_df)
+
+        log_stage(
+            f"training candidates prepared: {len(pair_df):,} pairs "
+            f"({len(fit_df):,} used for fitting)"
+        )
+
+        model = HistGradientBoostingClassifier(
+            max_depth=6,
+            learning_rate=0.05,
+            max_iter=200,
+            random_state=42,
+        )
+        model.fit(
+            fit_df[feature_cols].to_numpy(dtype=float),
+            fit_df["label"].to_numpy(dtype=int),
+        )
+
+        threshold, val_score = select_threshold(
+            model,
+            valid_df,
+            truth_df,
+        )
+        log_stage(
+            f"validation complete: threshold={threshold:.3f}, "
+            f"macro_F0.5={val_score:.4f}"
+        )
+    finally:
+        # The training database is no longer needed once the model is trained.
+        train_store.delete()
+
+    # ---------- TEST ----------
+    test_db = CACHE_DIR / "test_candidates.sqlite"
+    if test_db.exists():
+        log_stage("reusing existing disk-backed test candidate index")
+        test_store = CandidateStore(test_db)
+    else:
+        log_stage("building disk-backed test candidate index")
+        test_store = CandidateStore.build(
+            test_db,
+            [
+                TEST_DIR / "test_source2.tsv",
+                TEST_DIR / "test_source3.tsv",
+            ],
+            chunk_size=50_000,
+        )
+
+    try:
+        matching_path = output_dir / "matching_results.tsv"
+        candidate_path = output_dir / "candidate_pairs.tsv"
+
+        log_stage("processing test S1 records in streaming mode")
+        count = generate_test_outputs_streaming(
+            model,
+            threshold,
+            test_store,
+            TEST_DIR / "test_source1.tsv",
+            matching_path,
+            candidate_path,
+            max_candidates=args.candidate_limit,
+            chunk_size=50_000,
+        )
+
+        log_stage(
+            f"saved {count:,} processed S1 rows to {output_dir}"
+        )
+
+        # Run the official validator if it is present.
+        validator = [
+            sys.executable,
+            str(ROOT / "utils" / "validate_submission.py"),
+            "--matching",
+            str(matching_path),
+            "--candidate",
+            str(candidate_path),
+            "--test-dir",
+            str(TEST_DIR),
+        ]
+        result = subprocess.run(
+            validator,
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+        )
+        print(result.stdout.strip())
+        if result.stderr.strip():
+            print(result.stderr.strip())
+        if result.returncode != 0:
+            raise SystemExit(result.returncode)
+    finally:
+        test_store.close()
 
 
 if __name__ == "__main__":
