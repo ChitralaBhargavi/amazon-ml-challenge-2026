@@ -2,16 +2,20 @@
 
 This version keeps the real challenge data and uses a practical blocking +
 feature-based model design that is fast enough to run on a single workstation.
+It is optimized to avoid unnecessary in-memory copies of the large TSV files and to
+stream the heaviest source data through the candidate-index construction.
 """
 from __future__ import annotations
 
 import argparse
 import re
+import subprocess
+import sys
 import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -38,32 +42,63 @@ STOPWORDS = {
 }
 
 
-@dataclass
+@dataclass(slots=True)
 class Record:
     entity_id: str
-    business_name: str
-    business_address: str
     country: str
-    name_tokens: List[str]
-    address_tokens: List[str]
+    name_tokens: Tuple[str, ...]
+    address_tokens: Tuple[str, ...]
     normalized_name: str
     normalized_address: str
 
 
-def read_tsv(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path, sep="\t")
-    if path.name.endswith("ground_truth.tsv"):
-        required = ["source1_entity_id", "matched_entity_ids"]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            raise ValueError(f"Missing ground-truth columns {missing} in {path}")
-        return df
+def log_stage(message: str) -> None:
+    print(f"[pipeline] {message}", flush=True)
 
-    required = ["entity_id", "business_name", "business_address", "country"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns {missing} in {path}")
+
+def read_tsv(path: Path, *, nrows: Optional[int] = None, sample_n: Optional[int] = None, random_state: int = 42) -> pd.DataFrame:
+    dtypes = {
+        "entity_id": "string",
+        "business_name": "string",
+        "business_address": "string",
+        "country": "string",
+    }
+    if path.name.endswith("ground_truth.tsv"):
+        dtypes = {"source1_entity_id": "string", "matched_entity_ids": "string"}
+
+    df = pd.read_csv(
+        path,
+        sep="\t",
+        dtype=dtypes,
+        keep_default_na=False,
+        na_filter=False,
+        nrows=nrows,
+        low_memory=False,
+    )
+    if sample_n is not None and 0 < sample_n < len(df):
+        df = df.sample(n=sample_n, random_state=random_state).reset_index(drop=True)
     return df
+
+
+def iter_source_records(path: Path, *, chunk_size: int = 200_000) -> Iterator[Record]:
+    dtypes = {
+        "entity_id": "string",
+        "business_name": "string",
+        "business_address": "string",
+        "country": "string",
+    }
+
+    for chunk in pd.read_csv(
+        path,
+        sep="\t",
+        dtype=dtypes,
+        keep_default_na=False,
+        na_filter=False,
+        chunksize=chunk_size,
+        low_memory=False,
+    ):
+        for row in chunk.itertuples(index=False, name=None):
+            yield to_record_values(row[0], row[1], row[2], row[3])
 
 
 def ascii_normalize(value: Optional[str]) -> str:
@@ -87,30 +122,37 @@ def clean_text(raw: Optional[str], *, is_name: bool = False) -> str:
     return text
 
 
-def tokenise(raw: Optional[str], *, drop_stopwords: bool = False) -> List[str]:
+def tokenise(raw: Optional[str], *, drop_stopwords: bool = False) -> Tuple[str, ...]:
     cleaned = clean_text(raw)
     if not cleaned:
-        return []
+        return ()
     tokens = [t for t in cleaned.split() if t]
     if drop_stopwords:
         tokens = [t for t in tokens if t not in STOPWORDS]
-    return [t for t in tokens if len(t) > 1]
+    return tuple(t for t in tokens if len(t) > 1)
+
+
+def to_record_values(entity_id: object, business_name: object, business_address: object, country: object) -> Record:
+    name_raw = str(business_name or "")
+    address_raw = str(business_address or "")
+    name_clean = clean_text(name_raw, is_name=True)
+    address_clean = clean_text(address_raw)
+    return Record(
+        entity_id=str(entity_id),
+        country=str(country or ""),
+        name_tokens=tokenise(name_clean, drop_stopwords=True),
+        address_tokens=tokenise(address_clean),
+        normalized_name=name_clean,
+        normalized_address=address_clean,
+    )
 
 
 def to_record(row: pd.Series) -> Record:
-    name_clean = clean_text(row.get("business_name"), is_name=True)
-    address_clean = clean_text(row.get("business_address"))
-    name_tokens = tokenise(name_clean, drop_stopwords=True)
-    address_tokens = tokenise(address_clean)
-    return Record(
-        entity_id=str(row["entity_id"]),
-        business_name=str(row.get("business_name") or ""),
-        business_address=str(row.get("business_address") or ""),
-        country=str(row.get("country") or ""),
-        name_tokens=name_tokens,
-        address_tokens=address_tokens,
-        normalized_name=name_clean,
-        normalized_address=address_clean,
+    return to_record_values(
+        row.get("entity_id"),
+        row.get("business_name"),
+        row.get("business_address"),
+        row.get("country"),
     )
 
 
@@ -184,15 +226,19 @@ def build_var_index(records: Sequence[Record]) -> Dict[Tuple[str, str], Set[str]
     return index
 
 
-def generate_candidates(s1: Record, candidate_records: Sequence[Record], index: Dict[Tuple[str, str], Set[str]], max_candidates: int = 8) -> List[str]:
+def generate_candidates(
+    s1: Record,
+    candidate_records: Sequence[Record] | Dict[str, Record],
+    index: Dict[Tuple[str, str], Set[str]],
+    max_candidates: int = 8,
+) -> List[str]:
     if not s1.country:
         return []
 
     candidate_ids: Set[str] = set()
     for token in s1.name_tokens[:6] + s1.address_tokens[:6]:
-        if not token:
-            continue
-        candidate_ids |= index.get((s1.country, token), set())
+        if token:
+            candidate_ids |= index.get((s1.country, token), set())
     if s1.normalized_name:
         candidate_ids |= index.get((s1.country, s1.normalized_name), set())
     if s1.name_tokens:
@@ -200,7 +246,11 @@ def generate_candidates(s1: Record, candidate_records: Sequence[Record], index: 
         if bigram:
             candidate_ids |= index.get((s1.country, bigram), set())
 
-    rec_by_id = {rec.entity_id: rec for rec in candidate_records}
+    if isinstance(candidate_records, dict):
+        rec_by_id = candidate_records
+    else:
+        rec_by_id = {rec.entity_id: rec for rec in candidate_records}
+
     scored: List[Tuple[float, str]] = []
     for cand_id in candidate_ids:
         cand = rec_by_id.get(cand_id)
@@ -227,9 +277,9 @@ def generate_candidates(s1: Record, candidate_records: Sequence[Record], index: 
 
 def build_truth_map(truth_df: pd.DataFrame) -> Dict[str, Set[str]]:
     out: Dict[str, Set[str]] = {}
-    for _, row in truth_df.iterrows():
-        sid = str(row["source1_entity_id"])
-        ids = [x.strip() for x in str(row["matched_entity_ids"] or "").split(",") if x.strip()]
+    for row in truth_df.itertuples(index=False, name=None):
+        sid = str(row[0])
+        ids = [x.strip() for x in str(row[1] or "").split(",") if x.strip()]
         out[sid] = set(ids)
     return out
 
@@ -256,19 +306,23 @@ def build_train_dataset(
     if max_s1 is not None and 0 < max_s1 < len(train_s1):
         train_s1 = train_s1.sample(n=max_s1, random_state=42).reset_index(drop=True)
 
-    candidate_records = [to_record(r) for _, r in pd.concat([train_s2, train_s3], ignore_index=True).iterrows()]
-    index = build_var_index(candidate_records)
+    candidate_map: Dict[str, Record] = {}
+    for frame in (train_s2, train_s3):
+        for row in frame.itertuples(index=False, name=None):
+            rec = to_record_values(row[0], row[1], row[2], row[3])
+            candidate_map[rec.entity_id] = rec
+
+    index = build_var_index(candidate_map.values())
     truth_map = build_truth_map(truth_df)
-    rec_by_id = {rec.entity_id: rec for rec in candidate_records}
 
     rows: List[dict] = []
-    candidate_map: Dict[str, List[str]] = {}
-    for _, row in train_s1.iterrows():
-        s1 = to_record(row)
-        cand_ids = generate_candidates(s1, candidate_records, index, max_candidates=max_candidates)
-        candidate_map[s1.entity_id] = cand_ids
+    candidate_ids_by_s1: Dict[str, List[str]] = {}
+    for row in train_s1.itertuples(index=False, name=None):
+        s1 = to_record_values(row[0], row[1], row[2], row[3])
+        cand_ids = generate_candidates(s1, candidate_map, index, max_candidates=max_candidates)
+        candidate_ids_by_s1[s1.entity_id] = cand_ids
         for cand_id in cand_ids:
-            cand = rec_by_id.get(cand_id)
+            cand = candidate_map.get(cand_id)
             if cand is None:
                 continue
             feat = pair_features(s1, cand)
@@ -282,17 +336,17 @@ def build_train_dataset(
         raise RuntimeError("No training pairs were generated from the blocker.")
 
     feature_cols = [c for c in pair_df.columns if c not in {"source1_entity_id", "candidate_entity_id", "label"}]
-    s1_ids = train_s1["entity_id"].tolist()
+    s1_ids = train_s1["entity_id"].astype(str).tolist()
     _, valid_ids = train_test_split(s1_ids, test_size=0.15, random_state=42)
 
     valid_rows: List[dict] = []
     for sid in valid_ids:
-        s1_row = train_s1.loc[train_s1["entity_id"] == sid]
+        s1_row = train_s1.loc[train_s1["entity_id"].astype(str) == sid]
         if s1_row.empty:
             continue
         s1 = to_record(s1_row.iloc[0])
-        for cand_id in candidate_map.get(sid, []):
-            cand = rec_by_id.get(cand_id)
+        for cand_id in candidate_ids_by_s1.get(sid, []):
+            cand = candidate_map.get(cand_id)
             if cand is None:
                 continue
             feat = pair_features(s1, cand)
@@ -305,7 +359,7 @@ def build_train_dataset(
     if valid_df.empty:
         valid_df = pd.DataFrame(columns=[*feature_cols, "source1_entity_id", "candidate_entity_id", "label"])
 
-    return pair_df, valid_df, candidate_map
+    return pair_df, valid_df, candidate_ids_by_s1
 
 
 def select_threshold(model: HistGradientBoostingClassifier, valid_df: pd.DataFrame, truth_df: pd.DataFrame) -> Tuple[float, float]:
@@ -323,7 +377,7 @@ def select_threshold(model: HistGradientBoostingClassifier, valid_df: pd.DataFra
         values = []
         for sid in sorted(valid_df["source1_entity_id"].unique()):
             pred_ids = set(valid_df.loc[(valid_df["source1_entity_id"] == sid) & (valid_df["score"] >= threshold), "candidate_entity_id"])
-            values.append(f05_entity(truth_map.get(sid, set()), pred_ids))
+            values.append(f05_entity(truth_map.get(str(sid), set()), set(pred_ids)))
         metric = float(np.mean(values)) if values else 1.0
         if metric > best_score:
             best_score = metric
@@ -331,13 +385,28 @@ def select_threshold(model: HistGradientBoostingClassifier, valid_df: pd.DataFra
     return best_threshold, best_score
 
 
-def generate_test_outputs(model: HistGradientBoostingClassifier, threshold: float, max_candidates: int = 6) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    test_s1 = read_tsv(TEST_DIR / "test_source1.tsv")
-    test_s2 = read_tsv(TEST_DIR / "test_source2.tsv")
-    test_s3 = read_tsv(TEST_DIR / "test_source3.tsv")
-    records = [to_record(r) for _, r in pd.concat([test_s2, test_s3], ignore_index=True).iterrows()]
-    rec_by_id = {rec.entity_id: rec for rec in records}
-    index = build_var_index(records)
+def generate_test_outputs(
+    model: HistGradientBoostingClassifier,
+    threshold: float,
+    max_candidates: int = 6,
+    *,
+    test_s1: Optional[pd.DataFrame] = None,
+    test_s2: Optional[pd.DataFrame] = None,
+    test_s3: Optional[pd.DataFrame] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if test_s1 is None:
+        test_s1 = read_tsv(TEST_DIR / "test_source1.tsv")
+    if test_s2 is None:
+        test_s2 = read_tsv(TEST_DIR / "test_source2.tsv")
+    if test_s3 is None:
+        test_s3 = read_tsv(TEST_DIR / "test_source3.tsv")
+
+    candidate_map: Dict[str, Record] = {}
+    for frame in (test_s2, test_s3):
+        for row in frame.itertuples(index=False, name=None):
+            rec = to_record_values(row[0], row[1], row[2], row[3])
+            candidate_map[rec.entity_id] = rec
+    index = build_var_index(candidate_map.values())
 
     feature_cols = [
         "same_country", "same_name_exact", "same_address_exact", "name_jaccard", "address_jaccard",
@@ -348,9 +417,9 @@ def generate_test_outputs(model: HistGradientBoostingClassifier, threshold: floa
 
     candidate_rows: List[dict] = []
     match_rows: List[dict] = []
-    for _, row in test_s1.iterrows():
-        s1 = to_record(row)
-        cand_ids = generate_candidates(s1, records, index, max_candidates=max_candidates)
+    for row in test_s1.itertuples(index=False, name=None):
+        s1 = to_record_values(row[0], row[1], row[2], row[3])
+        cand_ids = generate_candidates(s1, candidate_map, index, max_candidates=max_candidates)
         candidate_rows.append({"source1_entity_id": s1.entity_id, "candidate_entity_ids": ",".join(cand_ids)})
 
         if not cand_ids:
@@ -359,7 +428,7 @@ def generate_test_outputs(model: HistGradientBoostingClassifier, threshold: floa
 
         hits = []
         for cand_id in cand_ids:
-            cand = rec_by_id.get(cand_id)
+            cand = candidate_map.get(cand_id)
             if cand is None:
                 continue
             feat = pair_features(s1, cand)
@@ -372,22 +441,73 @@ def generate_test_outputs(model: HistGradientBoostingClassifier, threshold: floa
     return pd.DataFrame(candidate_rows), pd.DataFrame(match_rows)
 
 
+def run_small_test() -> None:
+    sample_s1 = read_tsv(TRAIN_DIR / "train_source1.tsv", sample_n=25, random_state=42)
+    sample_s2 = read_tsv(TRAIN_DIR / "train_source2.tsv", sample_n=40, random_state=42)
+    sample_s3 = read_tsv(TRAIN_DIR / "train_source3.tsv", sample_n=40, random_state=42)
+    truth_df = read_tsv(TRAIN_DIR / "train_ground_truth.tsv")
+    truth_df = truth_df[truth_df["source1_entity_id"].astype(str).isin(sample_s1["entity_id"].astype(str).tolist())].copy().reset_index(drop=True)
+
+    print("=== Small-scale validation run ===")
+    print(f"TSV loading: S1={len(sample_s1)}, S2={len(sample_s2)}, S3={len(sample_s3)}, ground truth={len(truth_df)}")
+
+    pair_df, valid_df, _ = build_train_dataset(sample_s1, sample_s2, sample_s3, truth_df, max_s1=25, max_candidates=6)
+    feature_cols = [c for c in pair_df.columns if c not in {"source1_entity_id", "candidate_entity_id", "label"}]
+    print(f"Normalization/feature extraction: {len(feature_cols)} feature columns, {len(pair_df)} candidate pairs")
+
+    model = HistGradientBoostingClassifier(max_depth=4, learning_rate=0.08, max_iter=50, random_state=42)
+    model.fit(pair_df[feature_cols].to_numpy(dtype=float), pair_df["label"].to_numpy(dtype=int))
+    threshold, macro_f05 = select_threshold(model, valid_df, truth_df)
+    print(f"Model training + prediction + F0.5: threshold={threshold:.3f}, macro_F0.5={macro_f05:.4f}")
+
+    test_s1 = read_tsv(TEST_DIR / "test_source1.tsv", sample_n=12, random_state=7)
+    test_s2 = read_tsv(TEST_DIR / "test_source2.tsv", sample_n=18, random_state=7)
+    test_s3 = read_tsv(TEST_DIR / "test_source3.tsv", sample_n=18, random_state=7)
+    candidate_df, match_df = generate_test_outputs(model, threshold, max_candidates=6, test_s1=test_s1, test_s2=test_s2, test_s3=test_s3)
+
+    sample_output_dir = OUTPUT_DIR / "small_test"
+    sample_output_dir.mkdir(parents=True, exist_ok=True)
+    candidate_df.to_csv(sample_output_dir / "candidate_pairs.tsv", sep="\t", index=False)
+    match_df.to_csv(sample_output_dir / "matching_results.tsv", sep="\t", index=False)
+    test_dir = sample_output_dir
+    test_s1.to_csv(test_dir / "test_source1.tsv", sep="\t", index=False)
+    test_s2.to_csv(test_dir / "test_source2.tsv", sep="\t", index=False)
+    test_s3.to_csv(test_dir / "test_source3.tsv", sep="\t", index=False)
+    print(f"Output generation: {len(candidate_df)} candidate rows, {len(match_df)} match rows")
+
+    validator = [sys.executable, str(ROOT / "utils" / "validate_submission.py"), "--matching", str(test_dir / "matching_results.tsv"), "--candidate", str(test_dir / "candidate_pairs.tsv"), "--test-dir", str(test_dir)]
+    result = subprocess.run(validator, capture_output=True, text=True, cwd=str(ROOT))
+    print(result.stdout.strip())
+    if result.stderr.strip():
+        print(result.stderr.strip())
+    print(f"Submission validation exit code: {result.returncode}")
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Business entity resolution pipeline")
     parser.add_argument("--train-max-s1", type=int, default=2000, help="Maximum S1 rows used for training; set 0 to use all rows.")
     parser.add_argument("--candidate-limit", type=int, default=6, help="Maximum candidate IDs kept for each S1 entity.")
     parser.add_argument("--output-dir", type=str, default="output", help="Directory for generated TSV outputs.")
+    parser.add_argument("--small-test", action="store_true", help="Run a small, reproducible smoke test instead of the full dataset pipeline.")
     args = parser.parse_args()
+
+    if args.small_test:
+        run_small_test()
+        return
 
     output_dir = ROOT / args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    log_stage("loading training data")
     train_s1 = read_tsv(TRAIN_DIR / "train_source1.tsv")
     train_s2 = read_tsv(TRAIN_DIR / "train_source2.tsv")
     train_s3 = read_tsv(TRAIN_DIR / "train_source3.tsv")
     truth_df = read_tsv(TRAIN_DIR / "train_ground_truth.tsv")
+    log_stage(f"training data ready: S1={len(train_s1)}, S2={len(train_s2)}, S3={len(train_s3)}")
 
-    print(f"Training subset size: {len(train_s1)} rows")
+    log_stage("building candidate index")
     pair_df, valid_df, _ = build_train_dataset(
         train_s1,
         train_s2,
@@ -397,16 +517,20 @@ def main() -> None:
         max_candidates=args.candidate_limit,
     )
     feature_cols = [c for c in pair_df.columns if c not in {"source1_entity_id", "candidate_entity_id", "label"}]
+    log_stage(f"training candidates prepared: {len(pair_df)} pairs")
 
+    log_stage("training model")
     model = HistGradientBoostingClassifier(max_depth=6, learning_rate=0.05, max_iter=200, random_state=42)
     model.fit(pair_df[feature_cols].to_numpy(dtype=float), pair_df["label"].to_numpy(dtype=int))
     threshold, val_score = select_threshold(model, valid_df, truth_df)
-    print(f"Validation threshold chosen: {threshold:.3f}; macro F0.5 ≈ {val_score:.4f}")
+    log_stage(f"validation complete: threshold={threshold:.3f}, macro_F0.5={val_score:.4f}")
 
+    log_stage("processing test S1 records")
     candidate_df, match_df = generate_test_outputs(model, threshold, max_candidates=args.candidate_limit)
+    log_stage(f"writing outputs to {output_dir}")
     candidate_df.to_csv(output_dir / "candidate_pairs.tsv", sep="\t", index=False)
     match_df.to_csv(output_dir / "matching_results.tsv", sep="\t", index=False)
-    print(f"Saved {len(candidate_df)} candidate rows and {len(match_df)} prediction rows to {output_dir}")
+    log_stage(f"saved {len(candidate_df)} candidate rows and {len(match_df)} prediction rows")
 
 
 if __name__ == "__main__":
